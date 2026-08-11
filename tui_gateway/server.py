@@ -13823,16 +13823,22 @@ def _(rid, params: dict) -> dict:
         listening = owned_by_caller and is_listening()
         silent = listening and audio_is_silent()
         input_device = get_input_device_status(cfg)
-        hint = reqs.get("hint", "")
-        if input_device.get("error") and not hint:
-            hint = f"Wake-word input device could not be resolved: {input_device['error']}"
-        if silent and not hint:
-            hint = silent_audio_hint(input_device)
         # Effective capture: prefer the *armed* detector over config/auto.
         # With capture:auto the GUI arms client mode, but a bare status probe
         # would otherwise report "local" and the desktop would not reattach
         # the PCM feeder after wake.detected.
         frame = detector_frame_info()
+        hint = reqs.get("hint", "")
+        if input_device.get("error") and not hint:
+            hint = f"Wake-word input device could not be resolved: {input_device['error']}"
+        if silent and not hint:
+            # In client capture the mic is on the DESKTOP — the backend's own
+            # input device is irrelevant, so the hint must say so.
+            hint = silent_audio_hint(
+                input_device,
+                external_audio=bool(frame.get("external_audio")),
+                frames_seen=bool(frame.get("frames_seen", True)),
+            )
         if owned_by_caller and frame.get("external_audio"):
             capture = "client"
         elif owned_by_caller and listening:
