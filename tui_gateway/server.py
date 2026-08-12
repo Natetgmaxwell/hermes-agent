@@ -13829,7 +13829,17 @@ def _(rid, params: dict) -> dict:
         # the PCM feeder after wake.detected.
         frame = detector_frame_info()
         hint = reqs.get("hint", "")
-        if input_device.get("error") and not hint:
+        # Only a LOCAL-capture listener needs a backend input device. Under
+        # client capture the mic lives on the desktop and the backend host
+        # legitimately has none, so probing it fails with "Error querying
+        # device -1" — an internal detail that was being surfaced as the ear's
+        # tooltip and read as "the wake word is broken" when nothing was wrong.
+        _effective_capture = (
+            "client"
+            if frame.get("external_audio")
+            else str(probe_cfg.get("capture") or "local").strip().lower()
+        )
+        if _effective_capture != "client" and input_device.get("error") and not hint:
             hint = f"Wake-word input device could not be resolved: {input_device['error']}"
         if silent and not hint:
             # In client capture the mic is on the DESKTOP — the backend's own
