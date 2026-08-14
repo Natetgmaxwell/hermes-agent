@@ -170,6 +170,51 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     provider.start(stop_event, interval=interval)
 
 
+def _warm_local_stt_model() -> None:
+    """Load the local faster-whisper model in the background at startup.
+
+    ``_transcribe_local`` loads the model lazily under ``_local_model_lock``,
+    so the FIRST voice turn after every backend restart pays the load
+    (~1s for ``small``) on top of its own decode. That is the turn a user is
+    most likely to be judging responsiveness on. Warm it off-thread instead:
+    the cost lands while the socket is already accepting, and by the time
+    anyone speaks the model is resident.
+
+    No-op unless local STT is actually the configured provider — never pull a
+    multi-hundred-MB model into memory for a backend that will only ever call
+    a cloud transcription API.
+    """
+
+    def _run() -> None:
+        try:
+            from tools.transcription_tools import (
+                _get_provider,
+                _load_stt_config,
+                _normalize_local_model,
+                _load_local_whisper_model,
+            )
+
+            cfg = _load_stt_config()
+            if _get_provider(cfg) != "local":
+                return
+            local_cfg = cfg.get("local") or {}
+            model_name = _normalize_local_model(local_cfg.get("model"))
+            started = time.time()
+            _load_local_whisper_model(
+                model_name,
+                device=local_cfg.get("device", "auto"),
+                compute_type=local_cfg.get("compute_type", "auto"),
+            )
+            _log.info("STT prewarm: faster-whisper %r ready in %.2fs",
+                      model_name, time.time() - started)
+        except Exception as exc:
+            # Best-effort only: a failed prewarm must never block startup —
+            # the lazy path still runs on first use.
+            _log.debug("STT prewarm skipped: %s", exc)
+
+    threading.Thread(target=_run, name="stt-prewarm", daemon=True).start()
+
+
 def _warm_gateway_module() -> None:
     """Pre-import heavy modules so the event loop is not stalled on first use.
 
@@ -234,6 +279,9 @@ async def _lifespan(app: "FastAPI"):
     # run_in_executor still froze the event loop for 15-22 s, causing the
     # Desktop's 10-second WebSocket ready-probe to time out (GH-73083).
     _warm_gateway_module()
+    # Same idea, different cost: keep the first spoken turn off the model-load
+    # path. Backgrounded, so it cannot delay the socket.
+    _warm_local_stt_model()
 
     # Desktop-spawned backends (HERMES_DESKTOP=1) fire cron jobs themselves,
     # since the app has no gateway running the scheduler. Server `hermes
