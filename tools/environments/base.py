@@ -318,7 +318,7 @@ class BaseEnvironment(ABC):
         self._persist_env = persist_env
 
         self._session_id = uuid.uuid4().hex[:12]
-        temp_dir = self.get_temp_dir().rstrip("/") or "/"
+        temp_dir = self._session_artifact_dir().rstrip("/") or "/"
         self._snapshot_path = f"{temp_dir}/hermes-snap-{self._session_id}.sh"
         self._cwd_file = f"{temp_dir}/hermes-cwd-{self._session_id}.txt"
         self._cwd_marker = _cwd_marker(self._session_id)
@@ -385,21 +385,116 @@ class BaseEnvironment(ABC):
         return ()
 
     def _snapshot_excluded_passthrough_names(self) -> tuple[str, ...]:
-        """Profile-scoped names that must not persist in the snapshot. Monotonic for the
-        environment lifetime: an allowlist can be cleared after a value was captured, and
-        retaining the exclusion keeps that old value from leaking to a later profile."""
+        """Names that must not persist in the snapshot.
+
+        Two populations with different rules:
+
+        - Profile-scoped passthrough names: excluded only while MULTIPLEXING, where one
+          shared snapshot must not carry a previous profile's value into another
+          profile's command.
+        - Credential names: ALWAYS excluded. The snapshot is built from ``export -p``,
+          which dumps the whole process environment, so a credential the profile loader
+          injected would be written to disk in plaintext — and rewritten on essentially
+          every command. The names are re-injected into each command's environment via
+          ``Popen(env=run_env)``, so the snapshot does not need to carry them.
+        """
         if not self._profile_scoped_passthrough:
             return ()
+        names: tuple[str, ...] = ()
         try:
             from agent.secret_scope import is_multiplex_active
             if is_multiplex_active():
                 from tools.env_passthrough import get_all_passthrough
                 names = (*get_all_passthrough(), *self._additional_profile_scoped_passthrough_names())
-                self._snapshot_passthrough_names.update(
-                    name for name in names if isinstance(name, str) and _SHELL_ENV_NAME_RE.fullmatch(name))
         except Exception:
             logger.debug("Could not refresh profile-scoped snapshot exclusions", exc_info=True)
+        try:
+            names = (*names, *self._credential_env_names())
+        except Exception:
+            logger.debug("Could not enumerate credential names for snapshot exclusion", exc_info=True)
+        self._snapshot_passthrough_names.update(
+            name for name in names if isinstance(name, str) and _SHELL_ENV_NAME_RE.fullmatch(name))
         return tuple(sorted(self._snapshot_passthrough_names))
+
+    def _credential_env_names(self) -> tuple[str, ...]:
+        """Names of credentials that must never reach the snapshot. NAMES ONLY — never values.
+
+        Sources, in order of authority:
+
+        - the profile secret scope (``<home>/.env`` plus external secret sources): the
+          resolved credential names for this profile;
+        - each configured secret source's bootstrap token env, which never appears in the
+          resolved scope but does reach ``os.environ`` (and therefore ``export -p``);
+        - the platform's own credential classes (provider/tool credentials and
+          Hermes-internal secrets), which the spawn path already refuses to hand to a
+          child: a snapshot must not be the side channel that undoes that scrub.
+        """
+        names: set[str] = set()
+        try:
+            from agent.secret_scope import build_profile_secret_scope
+            names.update(build_profile_secret_scope(get_hermes_home()))
+        except Exception:
+            logger.debug("Could not enumerate profile secret names", exc_info=True)
+        names.update(self._secret_source_bootstrap_env_names())
+        names.update(self._platform_credential_env_names())
+        return tuple(sorted(name for name in names if isinstance(name, str) and name))
+
+    def _platform_credential_env_names(self) -> tuple[str, ...]:
+        """Names of credentials the spawn path already refuses to hand to a child.
+
+        The terminal backend scrubs provider/tool credentials and Hermes-internal
+        secrets from every ``Popen(env=run_env)`` it builds. The snapshot is written
+        from the login shell's own environment, which is NOT that scrubbed env — so
+        without this exclusion the scrub is undone by the snapshot: the value lands on
+        disk in plaintext and is re-exported into every later command of the session.
+        """
+        try:
+            from tools.environments.local_env_policy import (
+                _ALWAYS_STRIP_KEYS, _is_hermes_internal_secret, _is_provider_env_blocklisted,
+            )
+        except Exception:
+            logger.debug("Could not import the credential-class policy", exc_info=True)
+            return ()
+        names: set[str] = set(_ALWAYS_STRIP_KEYS)
+        for key in (*self.env.keys(), *os.environ.keys()):
+            if not isinstance(key, str):
+                continue
+            if _is_provider_env_blocklisted(key) or _is_hermes_internal_secret(key):
+                names.add(key)
+        return tuple(sorted(names))
+
+    def _secret_source_bootstrap_env_names(self) -> tuple[str, ...]:
+        """Bootstrap-auth env names declared by the configured secret sources.
+
+        A source's token env is the credential that unlocks the vault; it is seeded from a
+        gitignored ``.op.env`` or the launcher environment, so it reaches ``os.environ``
+        — and therefore ``export -p`` — while being absent from the resolved scope.
+        ``protected_env_vars()`` is each source's own declaration of "env vars no source
+        may overwrite", so a new or plugin-provided source is covered without editing
+        this method.
+        """
+        try:
+            from agent.secret_sources.registry import list_sources
+            from hermes_cli.env_loader import _load_secrets_config
+            secrets_cfg = _load_secrets_config(get_hermes_home()) or {}
+            names: set[str] = set()
+            for source in list_sources():
+                cfg = secrets_cfg.get(source.name)
+                names.update(source.protected_env_vars(cfg if isinstance(cfg, dict) else {}))
+            return tuple(sorted(name for name in names if isinstance(name, str) and name))
+        except Exception:
+            logger.debug("Could not enumerate secret-source bootstrap names", exc_info=True)
+            return ()
+
+    def _session_artifact_dir(self) -> str:
+        """Directory for the session snapshot and CWD marker.
+
+        Defaults to the backend temp dir. ``LocalEnvironment`` overrides it with a
+        Hermes-managed, profile-scoped root so the built-in cleanup owns these files:
+        the snapshot is a plaintext ``export -p`` dump that outlives the session that
+        wrote it, and the gateway's pruner only sweeps the managed root.
+        """
+        return self.get_temp_dir()
 
     def _snapshot_script_kwargs(self, cwd: str) -> dict:
         """Quoting inputs shared by the bootstrap and per-command wrapper scripts.

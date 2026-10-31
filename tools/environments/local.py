@@ -1064,6 +1064,37 @@ class LocalEnvironment(BaseEnvironment):
         super().__init__(cwd=_resolve_local_initial_cwd(cwd), timeout=timeout, env=env, persist_env=persistent)
         self.init_session()
 
+    def _session_artifact_dir(self) -> str:
+        """Where the session snapshot and CWD marker live.
+
+        The snapshot is a plaintext ``export -p`` dump of the login shell's environment
+        and it OUTLIVES the session that wrote it, so it must live where Hermes' own
+        pruner can reach it. ``get_temp_dir()`` prefers the platform temp dir (the
+        per-user ``TMPDIR`` on macOS), which ``cleanup_terminal_temp_cache()`` never
+        sweeps — it only prunes the managed ``HERMES_HOME/cache/terminal`` root. So the
+        session artifacts go to the managed root, while the background/code-exec
+        artifacts keep using ``get_temp_dir()``.
+
+        A user-pointed ``terminal.temp_dir`` still wins: it is a deliberate choice, and
+        the pruner leaves user-set paths alone, so those snapshots are cleaned up by the
+        user's own retention rather than by ours.
+        """
+        try:
+            from hermes_cli.config import cfg_get, load_config_readonly
+            configured = (cfg_get(load_config_readonly(), "terminal", "temp_dir", default="") or "").strip()
+        except Exception:
+            configured = ""
+        if configured and configured.startswith("/"):
+            return self.get_temp_dir()
+        managed = _default_terminal_temp_dir()
+        if managed is None:
+            return self.get_temp_dir()
+        try:
+            managed.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return self.get_temp_dir()
+        return str(managed).replace("\\", "/")
+
     def get_temp_dir(self) -> str:
         """Shell-safe writable temp dir. Precedence: ``TERMINAL_TEMP_DIR``, TMPDIR/TMP/TEMP
         (Termux has no system temp dir), ``HERMES_HOME/cache/terminal`` (real storage: a
