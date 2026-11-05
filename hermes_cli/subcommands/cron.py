@@ -93,6 +93,15 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "medium, high, xhigh, max, or ultra. Overrides agent.reasoning_effort "
             "and agent.reasoning_overrides for this job; unsupported levels are "
             "clamped by the provider at request time. Omit to follow config.")
+    cron_create.add_argument("--max-turns", dest="max_turns", type=int, default=None,
+        help="Cap this job's provider calls per run (overrides agent.max_turns). The turn "
+            "still ends with a summary; omit to follow config.")
+    cron_create.add_argument("--max-runtime", dest="max_runtime_seconds", type=int, default=None,
+        help="Wall-clock cap in seconds for this run (overrides agent.run_budget_seconds). A run "
+            "that reaches it is stopped and its last output delivered. Omit to follow config.")
+    cron_create.add_argument("--quiet-hours", dest="quiet_hours", default=None, metavar="HH:MM-HH:MM",
+        help="Hold this job's failure notices inside a local-time window (default 22:00-07:00). "
+            "The failure is still recorded and shown on the next run. Pass 'off' to alert at night.")
     cron_create.add_argument("--interpreter",
         help="Absolute or ~ path to a Python in your own venv (e.g. ~/venvs/report/bin/python) "
             "for a .py --script / --monitor-script, so it can import packages Hermes does not "
@@ -173,6 +182,13 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Pin this job's reasoning (thinking) effort: none, minimal, low, "
             "medium, high, xhigh, max, or ultra. Pass empty string to clear "
             "the pin and follow config resolution.")
+    cron_edit.add_argument("--max-turns", dest="max_turns", type=int, default=None,
+        help="Cap this job's provider calls per run. Pass 0 to clear and follow agent.max_turns.")
+    cron_edit.add_argument("--max-runtime", dest="max_runtime_seconds", type=int, default=None,
+        help="Wall-clock cap in seconds for this run. Pass 0 to clear the cap.")
+    cron_edit.add_argument("--quiet-hours", dest="quiet_hours", default=None, metavar="HH:MM-HH:MM",
+        help="Hold this job's failure notices inside this local-time window; 'off' alerts at night. "
+            "Pass empty string to follow cron.quiet_hours.")
     cron_edit.add_argument("--interpreter",
         help="Absolute or ~ path to a Python for a .py script / monitor script. "
             "Pass empty string to clear (back to Hermes' Python).")

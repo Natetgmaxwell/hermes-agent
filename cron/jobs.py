@@ -35,6 +35,10 @@ from hermes_constants import get_hermes_home
 from cron.constants import CLAIM_TTL_INACTIVITY_HEADROOM, FIRE_CLAIM_SKEW_SECONDS, FIRE_CLAIM_TTL_SECONDS
 from cron.env_settings import cron_env_setting
 from cron.jobs_invariants import _validate_job_mode_invariants, validate_schedule_knobs
+from cron.job_limits import (
+    normalize_max_runtime_seconds, normalize_max_turns, normalize_quiet_hours,
+    normalize_reasoning_effort,
+)
 from cron.jobs_model_pin import _main_model_pin
 from cron import jobs_time
 from cron.scheduler_ownership import _claim_owner_is_dead
@@ -1721,27 +1725,6 @@ def _normalize_failure_deliver(value: Any) -> Optional[str]:
     return _normalize_job_optional_text(value)
 
 
-def _normalize_reasoning_effort(value: Any) -> Optional[str]:
-    """Spelling-only validation via the shared parser (cron knob never stricter/looser than
-    config.yaml); model capability is deliberately NOT checked (model unknowable at create time,
-    transports clamp at send time). None for unset, lowercase level, or ValueError."""
-    if value is None:
-        return None
-    text = str(value).strip().lower()
-    if not text:
-        return None
-    from hermes_constants import parse_reasoning_effort
-
-    if parse_reasoning_effort(text) is None:
-        raise ValueError(
-            f"Invalid reasoning_effort {value!r}. Valid levels: "
-            "none, minimal, low, medium, high, xhigh, max, ultra "
-            "(empty string clears the override).")
-    if text in {"false", "disabled"}:
-        return "none"
-    return text
-
-
 # Normalizers for create_job (all fields) / update_job (present fields). Invalid values raise BEFORE
 # storing.
 def _normalize_catch_up(value: Any) -> Optional[bool]:
@@ -1767,6 +1750,9 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
+    "max_turns": normalize_max_turns,
+    "max_runtime_seconds": normalize_max_runtime_seconds,
+    "quiet_hours": normalize_quiet_hours,
 }
 _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     # [] is an explicit zero-tool allowlist and must survive the update path as [] too (#82010).
@@ -1775,7 +1761,10 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "monitor_script": _normalize_job_optional_text,
     "monitor_url": _normalize_job_optional_text,
     "interpreter": _normalize_job_optional_text,
-    "reasoning_effort": _normalize_reasoning_effort,
+    "reasoning_effort": normalize_reasoning_effort,
+    "max_turns": lambda v: None if v in {None, "", 0, "0"} else normalize_max_turns(v),
+    "max_runtime_seconds": lambda v: None if v in {None, "", 0, "0"} else normalize_max_runtime_seconds(v),
+    "quiet_hours": normalize_quiet_hours,
     # ``0`` is a real grace value (never catch up), so this normalizer must never use an
     # ``in {None, "", False}`` test — ``0 == False`` would silently clear it.
     "timezone": jobs_time.normalize_timezone,
@@ -1835,6 +1824,9 @@ def create_job(
     interpreter: Optional[str] = None,
     timezone: Optional[str] = None,
     grace_minutes: Optional[int] = None,
+    max_turns: Optional[int] = None,
+    max_runtime_seconds: Optional[int] = None,
+    quiet_hours: Optional[str] = None,
 ) -> dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -1870,7 +1862,7 @@ def create_job(
     f = {key: norm(raw[key]) for key, norm in _CREATE_FIELD_NORMALIZERS.items()}
     normalized_skills = _normalize_skill_list(skill, skills)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
-    normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
+    normalized_reasoning_effort = normalize_reasoning_effort(reasoning_effort)
 
     _validate_job_mode_invariants(f["monitor_script"], f["monitor_url"], f["no_agent"], f["script"])
     validate_schedule_knobs(parsed_schedule, f["timezone"], f["grace_minutes"])
@@ -1939,6 +1931,8 @@ def create_job(
         ("failure_deliver", f["failure_deliver"]), ("interpreter", f["interpreter"]),
         ("timezone", f["timezone"]), ("grace_minutes", f["grace_minutes"]),
         ("catch_up", f["catch_up"]),
+        ("max_turns", f["max_turns"]), ("max_runtime_seconds", f["max_runtime_seconds"]),
+        ("quiet_hours", f["quiet_hours"]),
     ):
         if value is not None:
             job[key] = value

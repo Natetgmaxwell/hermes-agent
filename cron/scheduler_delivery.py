@@ -18,6 +18,8 @@ import threading
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
+from cron.job_limits import failure_notice_hold_reason
+
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("cron.scheduler")
@@ -1775,6 +1777,16 @@ def _deliver_result(
     ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
     job.pop("_bot_chat_delivery_receipts", None)
     job.pop("_notification_all_targets_suppressed", None)
+    # An internal harness defect must not page a human at 2am (cron job ae9c87cd6272,
+    # 2026-10-28). The failure itself stays recorded — job last_failure, the incident ledger
+    # and the execution ledger — so the morning briefing path still sees it; only the page is
+    # held. Window: the job's, else cron.quiet_hours (cron/job_limits.py).
+    hold_reason = failure_notice_hold_reason(job) if for_failure else None
+    if hold_reason:
+        logger.info("Job %s: %s", job.get("id"), hold_reason)
+        job["_failure_notice_held"] = hold_reason
+        _record_delivery_verification(job, [])
+        return None
     targets = _resolve_delivery_targets(job, for_failure=for_failure)
     if not targets:
         _record_delivery_verification(job, [])

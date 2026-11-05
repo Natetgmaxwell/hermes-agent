@@ -39,6 +39,14 @@ Whichever provider a job resolves to, its provider-specific request settings (e.
 **Per-job reasoning effort.** A job can pin its own thinking level, independent of the model pin: one of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`. When set, it overrides both the global `agent.reasoning_effort` and per-model `agent.reasoning_overrides` for that job's runs (`none` disables thinking). Set it via `hermes cron create/edit --reasoning-effort high`; pass an empty string on edit to clear the pin and follow config again. (It is deliberately not exposed on the agent's `cronjob_manage` tool — model configuration stays a user decision.) Levels a model doesn't support are clamped or omitted by the provider at request time — pinning `xhigh` on a model that caps at `high` runs at `high`. The pin has no effect on `no_agent` jobs (there is no LLM call to tune). Use it to run heavy scheduled analyses at `high` while cheap recurring jobs run at `minimal`, without touching your global default.
 :::
 
+:::tip
+**Per-job run caps.** A job can bound its own runs in the two dimensions that actually matter to a schedule: provider calls (`--max-turns 40`) and wall clock (`--max-runtime 1200`, seconds). Each overrides `agent.max_turns` / the global run budget for that job only; omit both to follow config. A run that reaches either cap is not a failure: the model is asked for a final summary, the summary is delivered, and the execution ledger records the stop with its reason (`wall_clock_cap: ...`) and elapsed time. This is what keeps one runaway turn from holding a 20-minute schedule hostage for hours — the inactivity watchdog only fires on *silence*, and a slow-but-busy turn (long calls, growing context) is never silent. Clear a cap on edit with `--max-turns 0` / `--max-runtime 0`.
+:::
+
+:::tip
+**Quiet hours for failure notices.** A job (or `cron.quiet_hours` in config.yaml) can hold failure *notices* inside a local-time window — `--quiet-hours 22:00-07:00`, wrapping midnight, `off` to alert at night even with a global window set. The failure itself is still recorded on the job, in the incident ledger and in the execution ledger, so the next morning's run history and briefings still show it; only the page is held. Successful output is never held.
+:::
+
 :::warning
 Cron-run sessions cannot recursively create more cron jobs. Hermes disables cron management tools inside cron executions to prevent runaway scheduling loops.
 :::

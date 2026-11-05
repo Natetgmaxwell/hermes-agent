@@ -15,6 +15,7 @@ from typing import Any, Callable, List, Optional, Tuple
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.delegation_context import is_dispatcher_owned_worker_context
 from agent.interrupt_control import interrupted_during_api_call_reason
+from agent.run_budget import run_budget_exit_reason, run_budget_expired
 from agent.turn_failure_copy import exit_reason_failure, stamp_failure
 from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.message_content import flatten_message_text
@@ -121,21 +122,38 @@ def _guarded_cleanup(label: str, fn: Callable[[], Any], errors: list[str], logge
         logger.error("finalize_turn: _%s failed: %s", label, err, exc_info=True)
 
 
+def _run_budget_exhausted(agent) -> bool:
+    """The wall clock passed ``agent.run_budget_seconds``: the cap the loop stops on."""
+    return run_budget_expired(agent)
+
+
+def _iteration_budget_exhausted(agent, api_call_count) -> bool:
+    """The turn's API-call allowance is spent: the next loop test would exit."""
+    return bool(
+        api_call_count >= agent.max_iterations or agent.iteration_budget.remaining <= 0
+    )
+
+
 def _resolve_budget_fallback(
     agent, *, final_response, api_call_count, interrupted, failed, messages, _turn_exit_reason,
     _pending_verification_response, _pending_verification_response_previewed, logger,
 ) -> tuple[Any, Any, bool, Any]:
     """Iteration-budget exhaustion. Returns ``(final_response, _turn_exit_reason,
     preserved_verification_fallback, interrupted)``."""
-    budget_exhausted = (
-        api_call_count >= agent.max_iterations or agent.iteration_budget.remaining <= 0
-    )
+    budget_exhausted = _iteration_budget_exhausted(agent, api_call_count)
+    # A wall-clock cap is the same kind of stop with a different name; it must reach the
+    # same summary path, or a capped run reports "No reply" and looks like a model failure.
+    run_budget_exhausted = _run_budget_exhausted(agent)
     preserved_verification_fallback = False
     if (
-        final_response is None and budget_exhausted and not interrupted and not failed
+        not final_response and (budget_exhausted or run_budget_exhausted) and not interrupted
+        and not failed
         and str(_turn_exit_reason) in {"unknown", "budget_exhausted"}
     ):
-        _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
+        _turn_exit_reason = (
+            f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
+            if budget_exhausted else run_budget_exit_reason(agent)
+        )
         if _pending_verification_response:
             # A verification gate withheld a composed answer, then the budget ran out:
             # preserve it rather than make another fallible call. The explicit pending
@@ -646,6 +664,13 @@ def finalize_turn(
     # exit reason, fail the turn, and synthesize the visible close so the tail close in
     # ``_persist_step`` persists an assistant row. A turn that already streamed text is
     # left alone: ``_recover_final_from_stream`` owns that recovery (#95514).
+    #
+    # A capped turn keeps its own verdict instead of this generic close. An exhausted
+    # call or wall-clock budget is a *cap*, not a silent stop: the summary path above owns
+    # it, and minting "No reply" here reported the run as a hard failure and threw the
+    # actionable reason away (cron job ``ae9c87cd6272`` spent its whole 180-call budget and
+    # was recorded as "No reply: the turn stopped while a tool result was still pending").
+    # It also kept a named reason (``session_persistence_failed``) from being replaced.
     if (
         not final_response
         and not interrupted
@@ -653,6 +678,8 @@ def finalize_turn(
         and isinstance(messages[-1], dict)
         and messages[-1].get("role") == "tool"
         and not (getattr(agent, "_current_streamed_assistant_text", "") or "").strip()
+        and not _iteration_budget_exhausted(agent, api_call_count)
+        and not _run_budget_exhausted(agent)
     ):
         _turn_exit_reason = "pending_tool_result"
         failed = True
