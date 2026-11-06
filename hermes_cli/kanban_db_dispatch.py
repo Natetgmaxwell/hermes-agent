@@ -2695,9 +2695,18 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
 
 
 def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
-    """The profile owner executes; this subprocess only waits for its receipt."""
+    """The profile owner executes; this subprocess only waits for its receipt.
+
+    ``-P`` because the child runs with ``cwd`` = the card's workspace and ``python -m``
+    prepends that cwd to ``sys.path``: a workspace that is itself a hermes-agent checkout
+    would shadow the tree pinned on PYTHONPATH with its own (environment-less)
+    ``hermes_cli``/``hermes_bootstrap`` and die on ``no dependency environment is
+    committed`` before reaching the owner. Argv, not ``PYTHONSAFEPATH``: the env var
+    propagates to every interpreter the worker later spawns, which would break a
+    workspace-local ``python -m mymodule`` in the agent's own shell.
+    """
     import sys
-    return [sys.executable, "-m", "hermes_cli.kanban_worker_client"]
+    return [sys.executable, "-P", "-m", "hermes_cli.kanban_worker_client"]
 
 
 def _open_worker_log(task: Task, board: Optional[str]):
