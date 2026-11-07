@@ -120,6 +120,14 @@ def _stale_holder(row, now: float) -> bool:
     return float(row["expires_at"]) <= now or _compression_lock_holder_process_is_dead(row["holder"])
 
 
+def _rehydrate_reasoning_content(msg: dict[str, Any], reasoning: Any, reasoning_content: Any) -> None:
+    """Restore reasoning_content, rebuilt from reasoning when absent (byte-equal duplicates are not stored)."""
+    if reasoning_content is not None:
+        msg["reasoning_content"] = reasoning_content
+    elif reasoning:
+        msg["reasoning_content"] = reasoning
+
+
 class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
     """Message append/replace/rewind, reactions, resume conversations, replay dedupe (detached results: the base)."""
 
@@ -274,6 +282,11 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         ``message_id`` (yuanbao's message-dict convention)."""
         _str_or_none = lambda v: _scrub_surrogates(v) if isinstance(v, str) else None
         _reasoning = lambda key: msg.get(key) if keep_reasoning else None
+        # Canonical-column dedup: a byte-equal reasoning_content is not stored; decoders rebuild it.
+        reasoning_text = _scrub_surrogates(_reasoning("reasoning"))
+        reasoning_content_text = _scrub_surrogates(_reasoning("reasoning_content"))
+        if reasoning_text and reasoning_content_text == reasoning_text:
+            reasoning_content_text = None
         encoded_content = self._encode_content(msg.get("content"))
         encoded_tool_calls = json.dumps(tool_calls) if tool_calls else None
         encoded_tool_name = _scrub_surrogates(msg.get("tool_name"))
@@ -291,7 +304,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         return (session_id, role, encoded_content, msg.get("tool_call_id"),
             encoded_tool_calls, encoded_tool_name,
             msg.get("effect_disposition"), message_timestamp, msg.get("token_count"), msg.get("finish_reason"),
-            _scrub_surrogates(_reasoning("reasoning")), _scrub_surrogates(_reasoning("reasoning_content")),
+            _scrub_surrogates(_reasoning("reasoning")), reasoning_content_text,
             *(self._reasoning_json_text(_reasoning(k))
               for k in ("reasoning_details", "codex_reasoning_items", "codex_message_items")),
             msg.get("platform_message_id") or msg.get("message_id"),
@@ -370,9 +383,9 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
             if metadata is not None:
                 msg["display_metadata"] = metadata
         if row["role"] == "assistant":
-            for column in ("reasoning", "reasoning_content"):
-                if row[column] is not None:
-                    msg[column] = row[column]
+            if row["reasoning"] is not None:
+                msg["reasoning"] = row["reasoning"]
+            _rehydrate_reasoning_content(msg, row["reasoning"], row["reasoning_content"])
             for column in ("reasoning_details", "codex_reasoning_items", "codex_message_items"):
                 if row[column]:
                     msg[column] = _json_or(
@@ -1300,6 +1313,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         msg = dict(row)
         msg.pop("display_identity", None)
         msg.pop("display_order", None)
+        _rehydrate_reasoning_content(msg, msg.get("reasoning"), msg.get("reasoning_content"))
         if summary_flag and msg.pop("_compressed_summary", 0):
             msg["_compressed_summary"] = True
         msg["content"] = self._decode_content(msg["content"])
@@ -1625,8 +1639,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
                 msg["observed"] = True
             if row["role"] == "assistant":
                 msg.update((col, row[col]) for col in ("finish_reason", "reasoning") if row[col])
-                if row["reasoning_content"] is not None:
-                    msg["reasoning_content"] = row["reasoning_content"]
+                _rehydrate_reasoning_content(msg, row["reasoning"], row["reasoning_content"])
                 msg.update(
                     (col, _json_or(row[col], None, f"Failed to deserialize {col}, falling back to None"))
                     for col in ("reasoning_details", "codex_reasoning_items", "codex_message_items") if row[col])
