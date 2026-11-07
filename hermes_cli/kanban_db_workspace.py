@@ -429,11 +429,17 @@ def _cleanup_worktree_workspace(
     """Remove a finished task's linked git worktree when it holds no work.
     Mirrors the CLI startup pruner (``cli._prune_stale_worktrees``): removal
     requires a clean tree AND every commit reachable from a remote-tracking
-    ref; any doubt (dirty, unpushed, unresolvable repo, failing git) preserves
-    it. The auto-generated ``wt/<task-id>`` branch is deleted with it; custom
-    branches are kept. Best-effort."""
+    ref — or, when the local tracking refs are stale, a HEAD exactly matching
+    a remote branch head (``_worktree_branch_pushed_per_remote``); any doubt
+    (dirty, unpushed, unresolvable repo, failing git) preserves it. The
+    auto-generated ``wt/<task-id>`` branch is deleted with it; custom branches
+    and branches proven pushed only via the remote are kept. Best-effort."""
     try:
-        from hermes_cli.worktree_ops import _worktree_has_unpushed_commits, _worktree_is_dirty
+        from hermes_cli.worktree_ops import (
+            _worktree_branch_pushed_per_remote,
+            _worktree_has_unpushed_commits,
+            _worktree_is_dirty,
+        )
     except Exception:
         return  # CLI safety predicates unavailable — preserve
     try:
@@ -446,12 +452,26 @@ def _cleanup_worktree_workspace(
         repo_root = common.parent
         if _path_key(wp.resolve(strict=False)) == _path_key(repo_root.resolve(strict=False)):
             return  # never remove the main checkout
-        if _worktree_is_dirty(str(wp), str(repo_root)) or _worktree_has_unpushed_commits(str(wp)):
+        if _worktree_is_dirty(str(wp), str(repo_root)):
             _kb._log.info(
-                "Preserving worktree for task %s: dirty or unpushed work at %s",
+                "Preserving worktree for task %s: dirty work at %s",
                 task_id, wp,
             )
             return
+        keep_branch = False
+        if _worktree_has_unpushed_commits(str(wp)):
+            # Local remote-tracking refs go stale (a push from another clone or
+            # a single-branch refspec never updates them), so a fully-pushed
+            # tree can read unpushed here forever — the leak this backstop
+            # closes. The remote is read-only truth: anything but an exact
+            # branch-head match preserves the tree.
+            if not _worktree_branch_pushed_per_remote(str(wp), str(repo_root)):
+                _kb._log.info(
+                    "Preserving worktree for task %s: unpushed work at %s",
+                    task_id, wp,
+                )
+                return
+            keep_branch = True  # the branch head lives on origin: keep the ref
         # Windows cannot delete a directory while this process has its current
         # directory inside it. Completed workers normally run from their own
         # linked worktree, so move this process back to the main checkout
@@ -490,7 +510,7 @@ def _cleanup_worktree_workspace(
             return
         _kb._log.debug("Removed worktree workspace: %s", wp)
         branch = (branch_name or "").strip() or f"wt/{task_id}"
-        if branch.startswith("wt/"):
+        if branch.startswith("wt/") and not keep_branch:
             _git(repo_root, "branch", "-D", branch, timeout=30)
     except Exception:
         pass  # best-effort — never block completion

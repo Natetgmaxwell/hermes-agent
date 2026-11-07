@@ -759,6 +759,19 @@ def _worktree_branch_pushed_exact(
         return False
 
 
+def _worktree_branch_pushed_per_remote(worktree_path: str, repo_root: str, timeout: int = 10) -> bool:
+    """Remote-truth backstop for ``_worktree_has_unpushed_commits``: whether HEAD is
+    exactly a branch head on origin despite what the local remote-tracking refs say.
+
+    Local tracking refs go stale — a push from another clone (or a single-branch
+    refspec) never updates them — so a fully-pushed tree can read as unpushed
+    forever. One read-only ``ls-remote``, no ref mutation; fails SAFE toward False.
+    """
+    return _worktree_branch_pushed_exact(
+        worktree_path, _fetch_remote_branch_heads(repo_root, timeout=timeout), timeout=timeout,
+    )
+
+
 # ``hermes pid=<pid>`` (``/worktree new``), ``hermes pid=<pid> db=<state.db>`` (``-w`` / ``--tui -w`` launch)
 # and ``hermes session=<id> db=<state.db>`` (re-lock when the TUI exits). Read raw from the admin
 # dir: plain ``list --porcelain`` C-quotes a reason holding a backslash, a quote, a control or a

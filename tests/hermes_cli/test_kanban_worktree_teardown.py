@@ -175,6 +175,43 @@ def test_unpushed_commits_preserved(repo: Path) -> None:
     assert wt.is_dir()
 
 
+def test_pushed_worktree_with_stale_tracking_ref_removed_branch_kept(repo: Path) -> None:
+    """A fully-pushed branch whose local remote-tracking ref is missing must not
+    read as unpushed forever: the remote is asked, the tree is reclaimed, and
+    the branch ref survives in the parent repo."""
+    wt = _make_worktree(repo, "t_hhhh8888")
+    (wt / "task.txt").write_text("finished work\n", encoding="utf-8")
+    _git("-C", str(wt), "add", "task.txt")
+    _git("-C", str(wt), "commit", "-m", "task work")
+    _git("-C", str(wt), "push", "origin", "wt/t_hhhh8888")
+    # The push updated the tracking ref locally; drop it as a push from
+    # another clone (or a single-branch refspec) would have left it.
+    _git("-C", str(wt), "update-ref", "-d", "refs/remotes/origin/wt/t_hhhh8888")
+    kbw._cleanup_worktree_workspace("t_hhhh8888", str(wt), "wt/t_hhhh8888")
+    assert not wt.exists()
+    assert _branch_exists(repo, "wt/t_hhhh8888")
+
+
+def test_unreachable_remote_preserves_a_stale_ref_worktree(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The remote-truth backstop fails safe: when origin cannot be consulted,
+    a tree the local refs call unpushed is preserved."""
+    from hermes_cli import worktree_ops
+
+    wt = _make_worktree(repo, "t_iiii9999")
+    (wt / "task.txt").write_text("finished work\n", encoding="utf-8")
+    _git("-C", str(wt), "add", "task.txt")
+    _git("-C", str(wt), "commit", "-m", "task work")
+    _git("-C", str(wt), "push", "origin", "wt/t_iiii9999")
+    _git("-C", str(wt), "update-ref", "-d", "refs/remotes/origin/wt/t_iiii9999")
+    monkeypatch.setattr(
+        worktree_ops, "_fetch_remote_branch_heads", lambda *_a, **_k: None
+    )
+    kbw._cleanup_worktree_workspace("t_iiii9999", str(wt), "wt/t_iiii9999")
+    assert wt.is_dir()
+
+
 def test_custom_branch_survives_worktree_removal(repo: Path) -> None:
     wt = _make_worktree(repo, "t_dddd4444", branch="feature/custom")
     kbw._cleanup_worktree_workspace("t_dddd4444", str(wt), "feature/custom")
@@ -265,6 +302,40 @@ def test_archive_task_reaps_clean_worktree(kanban_home: Path, repo: Path) -> Non
         tid, wt = _worktree_task(conn, repo)
         assert kb.archive_task(conn, tid)
     assert not wt.exists()
+
+
+def _gc_args(event_days: int = 0, log_days: int = 0):
+    import argparse
+
+    return argparse.Namespace(
+        event_retention_days=event_days, log_retention_days=log_days
+    )
+
+
+def test_gc_reaps_done_worktrees_across_boards(kanban_home: Path, repo: Path) -> None:
+    """The gc workspace backstop must sweep every board's DB and see ``done``
+    cards, not just ``archived`` ones on the active board."""
+    from hermes_cli import kanban_ops
+
+    kb.create_board("games")
+    with kbc.connect_closing() as conn:
+        default_tid, default_wt = _worktree_task(conn, repo, title="done on default")
+        live_tid, live_wt = _worktree_task(conn, repo, title="still running")
+    with kbc.connect_closing(board="games") as conn:
+        games_tid, games_wt = _worktree_task(conn, repo, title="done on games")
+    for slug, tid, status in (
+        (None, default_tid, "done"),
+        ("games", games_tid, "done"),
+        (None, live_tid, "running"),
+    ):
+        with kbc.connect_closing(board=slug) as conn, kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
+
+    assert kanban_ops._cmd_gc(_gc_args()) == 0
+    assert not default_wt.exists()
+    assert not games_wt.exists()
+    # non-terminal cards keep their trees regardless of board
+    assert live_wt.is_dir()
 
 
 def test_parent_worktree_deferred_until_children_done(
