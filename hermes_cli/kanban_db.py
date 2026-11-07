@@ -305,14 +305,8 @@ def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
 # fork -> /proc window can report a fresh worker dead.
 DEFAULT_CRASH_GRACE_SECONDS = 30
 
-# Worker exit "provider rate-limited": released WITHOUT counting a failure (the
-# breaker must never trip on a throttle). 75 == BSD EX_TEMPFAIL.
-KANBAN_RATE_LIMIT_EXIT_CODE = 75
-
-# Worker exit "provider rejected the configuration": credential revoked (401/403), model gone
-# (404), TLS chain broken — a retry cannot fix it, so the dispatcher parks the card blocked on
-# the FIRST occurrence instead of spending ``failure_limit`` identical spawns. 78 == BSD EX_CONFIG.
-KANBAN_TERMINAL_PROVIDER_EXIT_CODE = 78
+# Worker exit sentinel codes (``KANBAN_*_EXIT_CODE``) live in
+# ``hermes_cli.kanban_worker_exit``; re-exported below as the facade.
 
 
 def _resolve_crash_grace_seconds() -> int:
@@ -4215,6 +4209,11 @@ from hermes_cli.kanban_db_workspace import (
     _is_managed_scratch_path,
     _managed_scratch_path_info,
     _scratch_workspace,
+)
+from hermes_cli.kanban_worker_exit import (
+    KANBAN_OWNER_REFUSED_EXIT_CODE,
+    KANBAN_RATE_LIMIT_EXIT_CODE,
+    KANBAN_TERMINAL_PROVIDER_EXIT_CODE,
 )
 from hermes_cli.kanban_db_dispatch import (
     DEFAULT_FAILURE_LIMIT,

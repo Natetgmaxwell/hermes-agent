@@ -56,6 +56,13 @@ class _Claim:
         return time.monotonic() - self.answered
 
 
+class OwnerRefusedAdmission(Exception):
+    """The owner's receipt settled ``unknown``: it retained the attempt and this
+    submitter cannot speak for it. The attempt never ran, so ``_submit`` exits
+    the ``KANBAN_OWNER_REFUSED_EXIT_CODE`` sentinel instead of a bare 1 the
+    crash sweep would book as the card's own work failure."""
+
+
 async def run(params, board_db):
     from agent.retry_utils import jittered_backoff
     from hermes_cli.gateway_client import connect_gateway, GatewayClientError, outside_restart_wait
@@ -145,9 +152,8 @@ async def _await_receipt(client, params, board_db, claim):
 
 
 def _exit_code(receipt, params, board_db):
-    from hermes_cli.gateway_client import GatewayClientError
     if receipt['status'] == 'unknown':
-        raise GatewayClientError('Kanban execution unknown; retained by owner')
+        raise OwnerRefusedAdmission('Kanban execution unknown; retained by owner')
     from gateway.session_kanban import worker_result
     result = worker_result(board_db, params)
     # The attempt's reply ends the log, as a one-shot worker's did: crash diagnostics quote it.
@@ -173,6 +179,7 @@ def main():
 
 
 def _submit():
+    from hermes_cli import kanban_db as _kb
     try:
         params = {'board': os.environ['HERMES_KANBAN_BOARD'], 'task_id': os.environ['HERMES_KANBAN_TASK'],
             'run_id': int(os.environ['HERMES_KANBAN_RUN_ID']), 'claim_lock': os.environ['HERMES_KANBAN_CLAIM_LOCK']}
@@ -185,6 +192,11 @@ def _submit():
         for key in ('HERMES_SESSION_SOURCE', 'HERMES_TENANT', 'TERMINAL_CWD'):
             os.environ.pop(key, None)
         return asyncio.run(run(params, board_db))
+    except OwnerRefusedAdmission as exc:
+        # Infrastructure, not the card's work: the sentinel exit books the run
+        # ``owner_refused`` without spending the card's failure budget.
+        print(f'Kanban owner refused: {exc}', file=sys.stderr)
+        return _kb.KANBAN_OWNER_REFUSED_EXIT_CODE
     except (KeyError, ValueError, OSError) as exc:
         print(f'Kanban owner refused: {exc}', file=sys.stderr)
         return 1
