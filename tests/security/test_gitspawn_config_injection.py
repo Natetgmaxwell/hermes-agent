@@ -236,6 +236,39 @@ def test_index_reading_probes_and_kanban_gc_git_are_safe(malicious_repo, tmp_pat
     assert _fired(marker) == []
 
 
+def test_remote_truth_probe_runs_no_repo_chosen_command(tmp_path):
+    """The publication-remote probe must not execute a command the repository names.
+
+    ``remote.<name>.uploadpack`` is a command the repository chooses, and git runs it when
+    a *named* local remote is contacted — so asking a remote by name turns a read into
+    command execution. The probe resolves the remote to a URL first and asks by URL, which
+    does not consult ``uploadpack`` at all. A remote helper (``ext::``) is the same hazard
+    by another name; the probe refuses such a URL and pins the child git to the transports
+    it is allowed to speak, so an ``insteadOf`` rewrite cannot reach one either.
+    """
+    from hermes_cli import worktree_ops
+
+    marker = tmp_path / "INJECTED"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, env=_CLEAN_GIT_ENV)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.email=a@b", "-c", "user.name=a",
+                    "commit", "-q", "--allow-empty", "-m", "init"], check=True, env=_CLEAN_GIT_ENV)
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", str(repo)],
+                   check=True, env=_CLEAN_GIT_ENV)
+    subprocess.run(["git", "-C", str(repo), "config", "remote.origin.uploadpack",
+                    f"sh -c 'touch {marker.as_posix()}; git-upload-pack'"],
+                   check=True, env=_CLEAN_GIT_ENV)
+
+    worktree_ops._fetch_remote_branch_heads(str(repo), timeout=20)
+    assert not marker.exists(), "the probe executed remote.origin.uploadpack"
+
+    subprocess.run(["git", "-C", str(repo), "config", "remote.origin.url",
+                    f"ext::sh -c 'touch {marker.as_posix()}'"], check=True, env=_CLEAN_GIT_ENV)
+    worktree_ops._fetch_remote_branch_heads(str(repo), timeout=20)
+    assert not marker.exists(), "the probe executed an ext:: remote helper"
+
+
 def _make_filter_repo(tmp: Path, attrs: str, config, marker: str) -> Path:
     """Committed repo whose ``.gitattributes`` is *attrs*; ``config(repo, marker)`` is appended to ``.git/config``."""
     repo = tmp / "repo"

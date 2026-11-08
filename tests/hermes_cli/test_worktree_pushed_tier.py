@@ -221,7 +221,7 @@ class TestAttendedGcPushedTier:
         records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
         by_name = {r.name: r for r in records}
         assert by_name["salv-lane"].verdict == "reap-keep-branch"
-        assert "pushed to origin" in by_name["salv-lane"].reason
+        assert "pushed to a remote" in by_name["salv-lane"].reason
 
         actions = worktree_gc.reclaim_worktrees(str(repo), records=records)
         assert any("salv-lane" in a and "kept" in a for a in actions)
@@ -296,3 +296,104 @@ class TestCronWorktreeMaintenance:
 
         assert not wt.exists(), "cron-tick maintenance must run the real pruner"
         assert _branch_exists(repo, "hermes/hermes-cronreap")
+
+
+# ---------------------------------------------------------------------------
+# Publication remotes that are not named origin.
+#
+# A repo can publish over ssh to a sibling clone (a remote named after the
+# machine) with no origin at all. Hardcoding `origin` made the remote-truth
+# backstop unanswerable there, so done-card worktrees leaked forever.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def repo_publishing_to_peer(tmp_path):
+    """A clone whose ONLY remote is a bare peer named ``macstudio``.
+
+    No ``origin`` exists, and the peer's fetch refspec mirrors every branch —
+    the topology where the peer is the publication destination with no branch
+    config recording the push.
+    """
+    bare = tmp_path / "studio.git"
+    bare.mkdir()
+    _run(["git", "init", "--bare", "--initial-branch=main"], bare)
+
+    repo = tmp_path / "clone"
+    repo.mkdir()
+    _run(["git", "init", "--initial-branch=main"], repo)
+    _run(["git", "config", "user.email", "test@test.com"], repo)
+    _run(["git", "config", "user.name", "Test"], repo)
+    (repo / "README.md").write_text("# repo\n")
+    _run(["git", "add", "."], repo)
+    _run(["git", "commit", "-m", "init"], repo)
+    _run(["git", "remote", "add", "macstudio", str(bare)], repo)
+    _run(["git", "config", "remote.macstudio.fetch", "+refs/heads/*:refs/remotes/macstudio/*"], repo)
+    _run(["git", "push", "macstudio", "main"], repo)
+    return repo
+
+
+def _peer_pushed_worktree(repo, name="t_peer", branch="v0.37/v2.0"):
+    """A worktree on *branch* whose head the peer holds, with no local tracking ref.
+
+    The push is followed by deleting ``refs/remotes/macstudio/<branch>``: a push from
+    another clone (or a pruned/never-created tracking ref) leaves the local refs silent
+    about a branch the remote really has — the state that reads as unpushed forever.
+    """
+    wt = _mk_worktree(repo, name, branch)
+    result = _run(["git", "push", "macstudio", branch], wt)
+    assert result.returncode == 0, result.stderr
+    _run(["git", "update-ref", "-d", f"refs/remotes/macstudio/{branch}"], repo)
+    assert worktree_ops._worktree_has_unpushed_commits(str(wt), timeout=20) is True
+    return wt
+
+
+class TestNonOriginPublicationRemote:
+    def test_peer_remote_is_the_publication_remote(self, repo_publishing_to_peer):
+        repo = repo_publishing_to_peer
+        wt = _peer_pushed_worktree(repo)
+
+        assert worktree_ops._publication_remotes((str(repo),)) == ["macstudio"]
+
+        heads = worktree_ops._fetch_remote_branch_heads(str(repo))
+        assert heads is not None
+        assert "v0.37/v2.0" in heads
+        assert worktree_ops._worktree_branch_pushed_exact(str(wt), heads) is True
+
+    def test_per_remote_backstop_true_without_origin(self, repo_publishing_to_peer):
+        repo = repo_publishing_to_peer
+        wt = _peer_pushed_worktree(repo)
+        # The card's repro: exact head on the peer, and no origin to ask.
+        assert worktree_ops._worktree_branch_pushed_per_remote(str(wt), str(repo)) is True
+
+    def test_gc_reaps_peer_pushed_tree_and_keeps_branch(self, repo_publishing_to_peer):
+        from hermes_cli import worktree_gc
+
+        repo = repo_publishing_to_peer
+        wt = _peer_pushed_worktree(repo)
+
+        records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
+        by_name = {r.name: r for r in records}
+        assert by_name["t_peer"].verdict == "reap-keep-branch"
+
+        worktree_gc.reclaim_worktrees(str(repo), records=records)
+        assert not wt.exists()
+        assert _branch_exists(repo, "v0.37/v2.0")
+
+    def test_ahead_of_peer_head_preserved(self, repo_publishing_to_peer):
+        repo = repo_publishing_to_peer
+        wt = _peer_pushed_worktree(repo)
+        (wt / "later.txt").write_text("post-push work\n")
+        _run(["git", "add", "later.txt"], wt)
+        _run(["git", "commit", "-m", "post-push commit"], wt)
+
+        assert worktree_ops._worktree_branch_pushed_per_remote(str(wt), str(repo)) is False
+
+    def test_unreachable_peer_preserved(self, repo_publishing_to_peer, tmp_path):
+        repo = repo_publishing_to_peer
+        wt = _peer_pushed_worktree(repo)
+        # The only publication remote is gone: cannot verify -> preserve.
+        _run(["git", "remote", "set-url", "macstudio", str(tmp_path / "missing.git")], repo)
+
+        assert worktree_ops._fetch_remote_branch_heads(str(repo)) is None
+        assert worktree_ops._worktree_branch_pushed_per_remote(str(wt), str(repo)) is False

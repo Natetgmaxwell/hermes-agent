@@ -151,15 +151,16 @@ def _classify_tree(_ops, repo_root: str, entry: Path, merge_cache, remote_heads)
         path, timeout=30, cache=merge_cache, max_ahead=_MAX_CHERRY_AHEAD):
         # Pushed-branch tier: single-branch fetch refspecs (managed-install default) leave pushed
         # PR branches with no refs/remotes/* entry, so `git log HEAD --not --remotes` reads them
-        # as unpushed forever. A head EXACTLY matching the remote branch has nothing origin lacks.
+        # as unpushed forever. A head EXACTLY matching a branch on a remote this repo publishes
+        # to has nothing that remote lacks; the remote need not be named origin.
         if not _ops._worktree_branch_pushed_exact(path, remote_heads, timeout=10):
             return "keep", "unpushed commits not found upstream", []
         blocked = _ops.removal_blocked(path)
         if blocked:
             return "keep", blocked[1], []
         if untracked:
-            return "reap-keep-branch", f"pushed to origin (open-PR lane); branch kept; {archive_note}", untracked
-        return "reap-keep-branch", "pushed to origin (open-PR lane); branch kept", []
+            return "reap-keep-branch", f"pushed to a remote (open-PR lane); branch kept; {archive_note}", untracked
+        return "reap-keep-branch", "pushed to a remote (open-PR lane); branch kept", []
     blocked = _ops.removal_blocked(path)
     if blocked:
         return "keep", blocked[1], []

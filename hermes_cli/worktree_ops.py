@@ -721,55 +721,243 @@ def _worktree_branch_pr_merged(
         return False
 
 
-def _fetch_remote_branch_heads(repo_root: str, timeout: int = 20) -> Optional[dict[str, str]]:
-    """``{branch: sha}`` for every branch on origin (one ``ls-remote``), or None = cannot verify, preserve.
+# ---------------------------------------------------------------------------
+# Remote truth: what the remotes this repository publishes to actually hold.
+# ---------------------------------------------------------------------------
 
-    Managed installs fetch a single-branch refspec, so pushed PR branches have no
-    remote-tracking ref and would read as unpushed forever.
+# Transports this module may speak to. The child git is pinned to this list, so a
+# repository cannot turn this read into a command: a remote helper (``ext::`` and
+# friends) runs one for any URL it is handed.
+_ALLOWED_REMOTE_SCHEMES = ("ssh", "https", "http", "git", "file")
+
+# The config that names a publication destination: each branch's push and tracking
+# remote, the repository-wide push default, and every remote's URLs, fetch refspec and
+# mirror flag.
+_PUBLICATION_CONFIG = (
+    r"^(branch\..*\.(remote|pushremote)|remote\.pushdefault|remote\..*\.(url|pushurl|fetch|mirror))$"
+)
+
+
+def _remote_config(cwd: str, pattern: str, timeout: int = 10) -> list[tuple[str, str]]:
+    """``(key, value)`` for the config entries matching *pattern*.
+
+    NUL-separated (``key\\nvalue``) so a branch name with spaces survives; keys come back
+    in git's canonical form (section and variable name lower-cased, subsection preserved).
     """
     try:
-        # Runs from the reclaim sweep, unattended: same transport pins as the base fetch.
-        result = _git(["ls-remote", "--heads", "origin"], repo_root, timeout=timeout,
-                      stdin=subprocess.DEVNULL, env=noninteractive_git_env())
-        if result.returncode != 0:
-            return None
-        pairs = (line.split("\t", 1) for line in result.stdout.splitlines())
-        return {p[1][len("refs/heads/"):].strip(): p[0].strip()
-                for p in pairs if len(p) == 2 and p[1].startswith("refs/heads/")}
+        out = _git_out(["config", "--no-includes", "-z", "--get-regexp", pattern], cwd,
+                       timeout=timeout, env=noninteractive_git_env())
+    except (OSError, subprocess.SubprocessError):
+        return []
+    entries: list[tuple[str, str]] = []
+    for record in (out or "").split("\0"):
+        key, sep, value = record.partition("\n")
+        if sep:
+            entries.append((key, value))
+    return entries
+
+
+def _publication_remotes(cwds: tuple[str, ...], branch: Optional[str] = None,
+                         timeout: int = 10) -> list[str]:
+    """The remotes this repository publishes branches to, in query order.
+
+    Derived from git's own configuration instead of hardcoding ``origin``, following git's
+    push-destination precedence: the branch's ``pushRemote``/``remote``, then
+    ``remote.pushDefault``, then ``origin`` (git's fallback), then every remote this
+    repository mirrors the whole branch space from — a full ``refs/heads/*`` fetch
+    refspec, or ``mirror = true``. That last rule is what catches the "publish to a
+    sibling clone over ssh" topology, where the destination is a remote named after the
+    machine and ``origin`` holds a different repository entirely.
+
+    Only remotes this repository configures a URL for are returned: a name in config
+    that no longer exists is not a destination.
+    """
+    configured: list[str] = []
+    for cwd in cwds:
+        try:
+            names = _git_out(["remote"], cwd, timeout=timeout, env=noninteractive_git_env()) or ""
+        except (OSError, subprocess.SubprocessError):
+            names = ""
+        for name in names.splitlines():
+            if name.strip() and name.strip() not in configured:
+                configured.append(name.strip())
+    if not configured:
+        return []
+
+    with_url: set[str] = set()
+    fetches: dict[str, list[str]] = {}
+    mirrored: set[str] = set()
+    ordered: list[str] = []
+
+    def add(name: str) -> None:
+        name = (name or "").strip()
+        if name in configured and name not in ordered:
+            ordered.append(name)
+
+    for cwd in cwds:
+        for key, value in _remote_config(cwd, _PUBLICATION_CONFIG, timeout):
+            if key.startswith("branch.") or key == "remote.pushdefault":
+                add(value)  # the value names the remote
+                continue
+            remote = key[len("remote."):].rsplit(".", 1)[0]
+            if key.endswith((".url", ".pushurl")):
+                if value.strip():
+                    with_url.add(remote)
+            elif key.endswith(".fetch"):
+                fetches.setdefault(remote, []).append(value)
+            elif key.endswith(".mirror") and value.strip().lower() == "true":
+                mirrored.add(remote)
+    add("origin")
+    for remote in configured:
+        specs = [spec.split(":", 1)[0].lstrip("+") for spec in fetches.get(remote, [])]
+        if remote in mirrored or any(spec in ("refs/heads/*", "refs/*") for spec in specs):
+            add(remote)
+    return [remote for remote in ordered if remote in with_url]
+
+
+def _remote_url_allowed(url: str) -> bool:
+    """Whether this module may speak to *url*: an allowed scheme, an scp-style
+    ``user@host:path`` or a plain local path — never a remote helper (``ext::cmd``),
+    which runs a command."""
+    if not url or url.startswith("-"):
+        return False
+    scheme, sep, _rest = url.partition("://")
+    return scheme.lower() in _ALLOWED_REMOTE_SCHEMES if sep else "::" not in url
+
+
+def _remote_urls(cwd: str, remote: str, timeout: int = 10) -> list[str]:
+    """Every URL *remote* answers at: its fetch URLs and its push URLs.
+
+    ``remote.<name>.pushurl`` can point somewhere else entirely, so both are asked;
+    ``git remote get-url`` applies ``insteadOf`` rewriting, so the URL probed is the one
+    git itself would use.
+    """
+    urls: list[str] = []
+    for extra in ([], ["--push"]):
+        try:
+            out = _git_out(["remote", "get-url", *extra, "--all", "--", remote], cwd,
+                           timeout=timeout, env=noninteractive_git_env())
+        except (OSError, subprocess.SubprocessError):
+            continue
+        for url in (out or "").splitlines():
+            url = url.strip()
+            if url and _remote_url_allowed(url) and url not in urls:
+                urls.append(url)
+    return urls
+
+
+def _ls_remote_heads(cwd: str, url: str, timeout: int,
+                     branch: Optional[str] = None) -> Optional[dict[str, str]]:
+    """``{branch: sha}`` from one URL, or None when it could not be consulted at all
+    (offline, refused, a failed ``ls-remote``) — unknown rather than empty.
+
+    Asked by URL, never by name: ``remote.<name>.uploadpack`` is a command the repository
+    chooses, and git runs it when a *named* remote is contacted. The ref pattern is the
+    full ``refs/heads/<branch>`` and the answer is re-checked against it, because
+    ``ls-remote`` patterns match a ref's tail (``foo`` also matches ``refs/heads/x/foo``).
+    """
+    args = ["ls-remote", "--heads", "--", url]
+    if branch:
+        args.append(f"refs/heads/{branch}")
+    env = noninteractive_git_env()
+    env["GIT_ALLOW_PROTOCOL"] = ":".join(_ALLOWED_REMOTE_SCHEMES)
+    try:
+        result = _git(args, cwd, timeout=timeout, stdin=subprocess.DEVNULL, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    heads: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        sha, sep, ref = line.partition("\t")
+        if not sep or not ref.startswith("refs/heads/"):
+            continue
+        name = ref[len("refs/heads/"):].strip()
+        if branch and name != branch:
+            continue  # a tail match: not the branch we asked about
+        heads[name] = sha.strip()
+    return heads
+
+
+def _fetch_remote_branch_heads(repo_root: str, timeout: int = 20, branch: Optional[str] = None,
+                               extra_cwds: tuple[str, ...] = ()) -> Optional[dict[str, set[str]]]:
+    """``{branch: {sha, ...}}`` for every branch on the remotes this repository publishes
+    to, or None = no remote could be consulted, so the caller must preserve.
+
+    Managed installs fetch a single-branch refspec, so a pushed PR branch has no
+    remote-tracking ref and would read as unpushed forever; a branch published to a peer
+    remote rather than to ``origin`` reads the same way. One read-only ``ls-remote`` per
+    remote, run in parallel, no ref mutation; a remote that will not answer is skipped —
+    its branches then read as unpublished, which preserves.
+    """
+    remotes = _publication_remotes((repo_root,) + extra_cwds, branch=branch, timeout=10)
+    if not remotes:
+        return None
+
+    def probe(remote: str) -> dict[str, str]:
+        merged: dict[str, str] = {}
+        for url in _remote_urls(repo_root, remote, timeout=10):
+            got = _ls_remote_heads(repo_root, url, timeout, branch)
+            if got is not None:
+                merged.update(got)
+        return merged
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, min(4, len(remotes))), thread_name_prefix="hermes-wt-lsremote"
+        ) as pool:
+            outcomes = list(pool.map(probe, remotes))
     except Exception:
         return None
+    heads: dict[str, set[str]] = {}
+    for outcome in outcomes:
+        for name, sha in outcome.items():
+            heads.setdefault(name, set()).add(sha)
+    return heads or None
 
 
 def _worktree_branch_pushed_exact(
-    worktree_path: str, remote_heads: Optional[dict[str, str]], timeout: int = 10,
+    worktree_path: str, remote_heads: Optional[dict[str, set[str]]], timeout: int = 10,
 ) -> bool:
-    """Whether the branch head is EXACTLY what origin holds (tree redundant; reap it, keep the branch).
+    """Whether the branch head is EXACTLY what a publication remote holds (tree redundant;
+    reap it, keep the branch).
 
-    Equality is deliberately the only True case: ahead/diverged heads have commits origin lacks
-    and ancestry can't be proven cheaply without remote-tracking refs -> fail SAFE toward preserve.
+    Equality is deliberately the only True case: ahead/diverged heads have commits the
+    remote lacks and ancestry can't be proven cheaply without remote-tracking refs ->
+    fail SAFE toward preserve.
     """
     if not remote_heads:
         return False
     try:
         branch = _worktree_current_branch(worktree_path, timeout)
-        remote_sha = remote_heads.get(branch) if branch is not None else None
-        return bool(remote_sha) and (
-            _git_out(["rev-parse", "HEAD"], worktree_path, timeout=timeout) == remote_sha)
+        if branch is None:
+            return False
+        head = _git_out(["rev-parse", "HEAD"], worktree_path, timeout=timeout)
+        return bool(head) and head in (remote_heads.get(branch) or ())
     except Exception:
         return False
 
 
 def _worktree_branch_pushed_per_remote(worktree_path: str, repo_root: str, timeout: int = 10) -> bool:
     """Remote-truth backstop for ``_worktree_has_unpushed_commits``: whether HEAD is
-    exactly a branch head on origin despite what the local remote-tracking refs say.
+    exactly a branch head on a remote this repository publishes to, despite what the local
+    remote-tracking refs say.
 
     Local tracking refs go stale — a push from another clone (or a single-branch
     refspec) never updates them — so a fully-pushed tree can read as unpushed
-    forever. One read-only ``ls-remote``, no ref mutation; fails SAFE toward False.
+    forever. Read-only ``ls-remote`` probes, no ref mutation; fails SAFE toward False.
     """
-    return _worktree_branch_pushed_exact(
-        worktree_path, _fetch_remote_branch_heads(repo_root, timeout=timeout), timeout=timeout,
-    )
+    try:
+        branch = _worktree_current_branch(worktree_path, timeout)
+    except Exception:
+        branch = None
+    if branch is None:
+        return False  # detached: no branch to be published under
+    # The worktree's own config can carry the branch's push destination
+    # (extensions.worktreeConfig), so both are consulted.
+    heads = _fetch_remote_branch_heads(repo_root, timeout=timeout, branch=branch,
+                                       extra_cwds=(worktree_path,))
+    return _worktree_branch_pushed_exact(worktree_path, heads, timeout=timeout)
 
 
 # ``hermes pid=<pid>`` (``/worktree new``), ``hermes pid=<pid> db=<state.db>`` (``-w`` / ``--tui -w`` launch)

@@ -293,7 +293,7 @@ def plan_sweep(repo_root: str, max_age_hours: int = 24, settings: Optional[dict]
             d.action, d.reason = blocked
         else:
             d.action = "remove-keep-branch" if verdict == "reap-keep-branch" else "remove"
-            d.reason = "pushed to origin; branch kept" if verdict == "reap-keep-branch" else "clean and merged/pushed"
+            d.reason = "pushed to a remote; branch kept" if verdict == "reap-keep-branch" else "clean and merged/pushed"
         decisions.append(d)
     if settings["max_total_gb"]:
         _apply_budget(decisions, settings["max_total_gb"], settings["archive_max_file_mb"])
