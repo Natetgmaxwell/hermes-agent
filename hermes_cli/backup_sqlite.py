@@ -118,7 +118,7 @@ class _OffThreadCopy:
     short joins instead, so the Desktop's pre-flight deadline interrupts the snapshot promptly."""
 
     def __init__(self, copy) -> None:
-        self._copy, self._error = copy, None
+        self._copy, self._error, self._finished = copy, None, False
         # health: allow HX012 -- stdlib-only file (the Desktop runs it when app imports cannot load); the copy reads no profile state
         self.thread = threading.Thread(target=self._run, name="sqlite-snapshot", daemon=True)
 
@@ -127,6 +127,8 @@ class _OffThreadCopy:
             self._copy()
         except BaseException as exc:  # health: allow BLE001 -- handed to the waiting main thread, which re-raises it
             self._error = exc
+        finally:
+            self._finished = True
 
     def run(self) -> None:
         self.thread.start()
@@ -135,8 +137,13 @@ class _OffThreadCopy:
         if self._error is not None:
             raise self._error
 
-    def running(self) -> bool:
-        return self.thread.is_alive()
+    def finished(self) -> bool:
+        # NOT thread.is_alive(): a SIGTERM unwinding the main thread out of join() can leave the
+        # Thread bookkeeping reporting stopped (_is_stopped, tstate lock gone) while the worker is
+        # still inside the C sqlite3_backup_step; trusting it closes live connections and the
+        # process dies on SIGSEGV before the staging cleanup runs. This flag flips only after the
+        # C call has returned, which no liveness primitive can fake.
+        return self._finished
 
 
 def _safe_copy_db(src: Path, dst: Path, *, timeout_seconds: float = 10.0) -> bool:
@@ -198,9 +205,10 @@ def _safe_copy_db(src: Path, dst: Path, *, timeout_seconds: float = 10.0) -> boo
         return False
     finally:
         # Interrupted mid-copy (SIGTERM -> SystemExit): the worker is still inside the C copy with
-        # both connections, and close() would wait on their mutex until the copy ends. The process
-        # is exiting; leave them to it, and the caller unlinks the staging file.
-        if copier is None or not copier.running():
+        # both connections; closing them concurrently segfaults the process before the caller's
+        # staging cleanup can run. The process is exiting; leave the connections to it, and the
+        # caller unlinks the staging file.
+        if copier is None or copier.finished():
             _close_quietly(backup_conn)
             _close_quietly(conn)
 
